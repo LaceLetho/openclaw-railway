@@ -55,6 +55,22 @@ function createWrappedTelegramClientFetchWithTransport(params: {
 }
 
 describe("createTelegramBot fetch abort", () => {
+  it("closes the resolved Telegram transport when the bot stops", async () => {
+    const transportClose = vi.fn(async () => undefined);
+    const bot = createTelegramBot({
+      token: "tok",
+      telegramTransport: {
+        fetch: globalThis.fetch,
+        sourceFetch: globalThis.fetch,
+        close: transportClose,
+      },
+    });
+
+    await bot.stop();
+
+    expect(transportClose).toHaveBeenCalledTimes(1);
+  });
+
   it("aborts wrapped client fetch when fetchAbortSignal aborts", async () => {
     const fetchSpy = vi.fn(
       (_input: RequestInfo | URL, init?: RequestInit) =>

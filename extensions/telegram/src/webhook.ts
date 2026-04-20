@@ -267,12 +267,23 @@ export async function startTelegramWebhook(opts: {
   const webhookRegistrationRetryPolicy =
     opts.webhookRegistrationRetryPolicy ?? TELEGRAM_WEBHOOK_REGISTRATION_RETRY_POLICY;
   const diagnosticsEnabled = isDiagnosticsEnabled(opts.config);
+  const fetchAbortController = new AbortController();
+  const abortFetch = () => fetchAbortController.abort();
+  const removeAbortFetchListener = () => {
+    opts.abortSignal?.removeEventListener("abort", abortFetch);
+  };
+  if (opts.abortSignal?.aborted) {
+    abortFetch();
+  } else {
+    opts.abortSignal?.addEventListener("abort", abortFetch, { once: true });
+  }
   const bot = createTelegramBot({
     token: opts.token,
     runtime,
     proxyFetch: opts.fetch,
     config: opts.config,
     accountId: opts.accountId,
+    fetchAbortSignal: fetchAbortController.signal,
   });
   await initializeTelegramWebhookBot({
     bot,
@@ -422,6 +433,8 @@ export async function startTelegramWebhook(opts: {
       // withTelegramApiErrorLogging has already emitted the failure.
     });
     server.close();
+    removeAbortFetchListener();
+    fetchAbortController.abort();
     void bot.stop();
     status.noteWebhookStop();
     if (diagnosticsEnabled) {
@@ -499,6 +512,8 @@ export async function startTelegramWebhook(opts: {
   const closeAfterStartupFailure = () => {
     shutDown = true;
     server.close();
+    removeAbortFetchListener();
+    fetchAbortController.abort();
     void bot.stop();
     status.noteWebhookStop();
     if (diagnosticsEnabled) {

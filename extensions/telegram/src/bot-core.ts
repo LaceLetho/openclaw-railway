@@ -413,9 +413,13 @@ export function createTelegramBotCore(
   });
 
   const originalStop = bot.stop.bind(bot);
-  bot.stop = ((...args: Parameters<typeof originalStop>) => {
+  bot.stop = (async (...args: Parameters<typeof originalStop>) => {
     threadBindingManager?.stop();
-    return originalStop(...args);
+    try {
+      return await originalStop(...args);
+    } finally {
+      await telegramTransport.close?.();
+    }
   }) as typeof bot.stop;
 
   return bot;

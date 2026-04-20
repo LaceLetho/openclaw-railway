@@ -35,6 +35,8 @@ const log = createSubsystemLogger("telegram/network");
 const TELEGRAM_AUTO_SELECT_FAMILY_ATTEMPT_TIMEOUT_MS = 300;
 const TELEGRAM_API_HOSTNAME = "api.telegram.org";
 const TELEGRAM_FALLBACK_IPS: readonly string[] = ["149.154.167.220"];
+const TELEGRAM_TRANSPORT_IDLE_CLOSE_MS_ENV = "OPENCLAW_TELEGRAM_TRANSPORT_IDLE_CLOSE_MS";
+const DEFAULT_RAILWAY_TELEGRAM_TRANSPORT_IDLE_CLOSE_MS = 1_000;
 
 // Dispatcher defaults that bound the per-origin connection pool. Telegram long
 // polling keeps a handful of connections hot for hours, so the defaults must be
@@ -87,6 +89,7 @@ type TelegramDispatcherAttempt = {
 
 type TelegramTransportAttempt = {
   createDispatcher: () => TelegramDispatcher;
+  closeDispatcher?: () => Promise<void>;
   exportAttempt: TelegramDispatcherAttempt;
   logLevel?: "debug" | "warn";
   logMessage?: string;
@@ -504,17 +507,59 @@ export type TelegramTransport = {
   close(): Promise<void>;
 };
 
+async function destroyTelegramDispatcher(dispatcher: TelegramDispatcher | null): Promise<void> {
+  if (!dispatcher) {
+    return;
+  }
+  try {
+    await dispatcher.destroy();
+  } catch {
+    // Intentionally ignored: dispatcher may already be destroyed.
+  }
+}
+
+function resolveTelegramTransportIdleCloseMs(): number | null {
+  const raw = process.env[TELEGRAM_TRANSPORT_IDLE_CLOSE_MS_ENV]?.trim();
+  if (raw) {
+    const parsed = Number.parseInt(raw, 10);
+    if (Number.isFinite(parsed) && parsed >= 0) {
+      return parsed;
+    }
+    return null;
+  }
+  if (process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_PROJECT_ID) {
+    return DEFAULT_RAILWAY_TELEGRAM_TRANSPORT_IDLE_CLOSE_MS;
+  }
+  return null;
+}
+
 function createTelegramTransportAttempts(params: {
   defaultDispatcher: ReturnType<typeof createTelegramDispatcher>;
+  defaultPolicy: PinnedDispatcherPolicy;
   allowFallback: boolean;
   fallbackPolicy?: PinnedDispatcherPolicy;
   ownedDispatchers: Set<TelegramDispatcher>;
 }): TelegramTransportAttempt[] {
-  params.ownedDispatchers.add(params.defaultDispatcher.dispatcher);
+  let defaultDispatcher: TelegramDispatcher | null = params.defaultDispatcher.dispatcher;
+  params.ownedDispatchers.add(defaultDispatcher);
 
   const attempts: TelegramTransportAttempt[] = [
     {
-      createDispatcher: () => params.defaultDispatcher.dispatcher,
+      createDispatcher: () => {
+        if (!defaultDispatcher) {
+          defaultDispatcher = createTelegramDispatcher(params.defaultPolicy).dispatcher;
+          params.ownedDispatchers.add(defaultDispatcher);
+        }
+        return defaultDispatcher;
+      },
+      closeDispatcher: async () => {
+        const dispatcher = defaultDispatcher;
+        defaultDispatcher = null;
+        if (dispatcher) {
+          params.ownedDispatchers.delete(dispatcher);
+        }
+        await destroyTelegramDispatcher(dispatcher);
+      },
       exportAttempt: { dispatcherPolicy: params.defaultDispatcher.effectivePolicy },
     },
   ];
@@ -533,6 +578,14 @@ function createTelegramTransportAttempts(params: {
         ownedDispatchers.add(ipv4Dispatcher);
       }
       return ipv4Dispatcher;
+    },
+    closeDispatcher: async () => {
+      const dispatcher = ipv4Dispatcher;
+      ipv4Dispatcher = null;
+      if (dispatcher) {
+        ownedDispatchers.delete(dispatcher);
+      }
+      await destroyTelegramDispatcher(dispatcher);
     },
     exportAttempt: { dispatcherPolicy: fallbackPolicy },
     logLevel: "debug",
@@ -559,6 +612,14 @@ function createTelegramTransportAttempts(params: {
       }
       return fallbackIpDispatcher;
     },
+    closeDispatcher: async () => {
+      const dispatcher = fallbackIpDispatcher;
+      fallbackIpDispatcher = null;
+      if (dispatcher) {
+        ownedDispatchers.delete(dispatcher);
+      }
+      await destroyTelegramDispatcher(dispatcher);
+    },
     exportAttempt: { dispatcherPolicy: fallbackIpPolicy },
     logLevel: "warn",
     logMessage: "fetch fallback: DNS-resolved IP unreachable; trying alternative Telegram API IP",
@@ -573,15 +634,7 @@ async function destroyOwnedDispatchers(dispatchers: Iterable<TelegramDispatcher>
   // already decided to abandon (session aborted, or stale transport being
   // replaced after a stall). The per-dispatcher try/catch isolates failures
   // (already-destroyed dispatchers throw) so Promise.all never rejects.
-  await Promise.all(
-    [...dispatchers].map(async (dispatcher) => {
-      try {
-        await dispatcher.destroy();
-      } catch {
-        // Intentionally ignored: dispatcher may already be destroyed.
-      }
-    }),
-  );
+  await Promise.all([...dispatchers].map((dispatcher) => destroyTelegramDispatcher(dispatcher)));
 }
 
 export function resolveTelegramTransport(
@@ -649,10 +702,38 @@ export function resolveTelegramTransport(
   const ownedDispatchers = new Set<TelegramDispatcher>();
   const transportAttempts = createTelegramTransportAttempts({
     defaultDispatcher,
+    defaultPolicy: defaultDispatcher.effectivePolicy,
     allowFallback: allowStickyFallback,
     fallbackPolicy: fallbackDispatcherPolicy,
     ownedDispatchers,
   });
+
+  const idleCloseMs = resolveTelegramTransportIdleCloseMs();
+  let idleCloseTimer: ReturnType<typeof setTimeout> | null = null;
+  const closeTransportDispatchers = async () => {
+    if (idleCloseTimer) {
+      clearTimeout(idleCloseTimer);
+      idleCloseTimer = null;
+    }
+    await Promise.all(
+      transportAttempts.map(async (attempt) => {
+        await attempt.closeDispatcher?.().catch(() => undefined);
+      }),
+    );
+  };
+  const scheduleIdleClose = () => {
+    if (idleCloseMs === null) {
+      return;
+    }
+    if (idleCloseTimer) {
+      clearTimeout(idleCloseTimer);
+    }
+    idleCloseTimer = setTimeout(() => {
+      idleCloseTimer = null;
+      void closeTransportDispatchers();
+    }, idleCloseMs);
+    idleCloseTimer.unref?.();
+  };
 
   let stickyAttemptIndex = 0;
   let stickySuccessCount = 0;
@@ -829,16 +910,19 @@ export function resolveTelegramTransport(
               : { subsystem: "telegram-fetch", fallbackAttempt: attemptIndex },
         });
         recordSuccessfulAttempt(attemptIndex);
+        scheduleIdleClose();
         return response;
       } catch (caught) {
         err = caught;
         if (!shouldUseTelegramTransportFallback(err)) {
+          scheduleIdleClose();
           throw err;
         }
         recordAttemptFailure(attemptIndex, err);
       }
     }
 
+    scheduleIdleClose();
     throw err;
   }) as typeof fetch;
 
@@ -848,6 +932,10 @@ export function resolveTelegramTransport(
       return;
     }
     closed = true;
+    if (idleCloseTimer) {
+      clearTimeout(idleCloseTimer);
+      idleCloseTimer = null;
+    }
     const toDestroy = [...ownedDispatchers];
     ownedDispatchers.clear();
     await destroyOwnedDispatchers(toDestroy);
