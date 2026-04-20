@@ -99,6 +99,13 @@ const log = createSubsystemLogger("gateway").child("model-pricing");
 let refreshTimer: ReturnType<typeof setTimeout> | null = null;
 let inFlightRefresh: Promise<void> | null = null;
 
+function isGatewayModelPricingRefreshDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return (
+    env.OPENCLAW_DISABLE_GATEWAY_MODEL_PRICING_REFRESH === "1" ||
+    env.OPENCLAW_DISABLE_OPENROUTER_MODEL_CATALOG === "1"
+  );
+}
+
 function clearRefreshTimer(): void {
   if (!refreshTimer) {
     return;
@@ -1385,7 +1392,11 @@ export async function refreshGatewayModelPricingCache(
 export function startGatewayModelPricingRefresh(
   params: GatewayModelPricingRefreshParams,
 ): () => void {
-  if (!isGatewayModelPricingEnabled(params.config)) {
+  if (
+    !isGatewayModelPricingEnabled(params.config) ||
+    isGatewayModelPricingRefreshDisabled(params.env)
+  ) {
+    log.info("pricing bootstrap disabled");
     clearRefreshTimer();
     clearGatewayModelPricingFailures();
     return () => {};

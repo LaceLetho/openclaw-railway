@@ -96,18 +96,36 @@ function requireAbortSignal(signal: RequestInit["signal"] | undefined): AbortSig
 }
 
 describe("model-pricing-cache", () => {
+  const originalDisableGatewayModelPricingRefresh =
+    process.env.OPENCLAW_DISABLE_GATEWAY_MODEL_PRICING_REFRESH;
+  const originalDisableOpenRouterModelCatalog =
+    process.env.OPENCLAW_DISABLE_OPENROUTER_MODEL_CATALOG;
+
   beforeEach(() => {
     resetGatewayModelPricingCacheForTest();
     pluginManifestRegistryMocks.manifestRegistry = undefined;
     pluginManifestRegistryMocks.loadPluginManifestRegistryForInstalledIndex.mockClear();
     pluginManifestRegistryMocks.listOpenClawPluginManifestMetadata.mockClear();
     normalizeProviderModelIdWithRuntimeMock.mockClear();
+    delete process.env.OPENCLAW_DISABLE_GATEWAY_MODEL_PRICING_REFRESH;
+    delete process.env.OPENCLAW_DISABLE_OPENROUTER_MODEL_CATALOG;
   });
 
   afterEach(() => {
     resetGatewayModelPricingCacheForTest();
     loggingState.rawConsole = null;
     resetLogger();
+    if (originalDisableGatewayModelPricingRefresh === undefined) {
+      delete process.env.OPENCLAW_DISABLE_GATEWAY_MODEL_PRICING_REFRESH;
+    } else {
+      process.env.OPENCLAW_DISABLE_GATEWAY_MODEL_PRICING_REFRESH =
+        originalDisableGatewayModelPricingRefresh;
+    }
+    if (originalDisableOpenRouterModelCatalog === undefined) {
+      delete process.env.OPENCLAW_DISABLE_OPENROUTER_MODEL_CATALOG;
+    } else {
+      process.env.OPENCLAW_DISABLE_OPENROUTER_MODEL_CATALOG = originalDisableOpenRouterModelCatalog;
+    }
   });
 
   it("collects configured model refs across defaults, aliases, overrides, and media tools", () => {
@@ -1259,6 +1277,28 @@ describe("model-pricing-cache", () => {
       cacheRead: 0.16,
       cacheWrite: 0,
     });
+  });
+
+  it("does not bootstrap OpenRouter pricing when model catalog fetches are disabled", async () => {
+    process.env.OPENCLAW_DISABLE_OPENROUTER_MODEL_CATALOG = "1";
+    const fetchImpl = vi.fn(async () => {
+      throw new Error("should not fetch");
+    }) as unknown as typeof fetch;
+
+    const stop = startGatewayModelPricingRefresh({
+      config: {
+        agents: {
+          defaults: {
+            model: { primary: "anthropic/claude-opus-4-6" },
+          },
+        },
+      } as unknown as OpenClawConfig,
+      fetchImpl,
+    });
+    await vi.dynamicImportSettled();
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    stop();
   });
 });
 
